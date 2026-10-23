@@ -707,6 +707,9 @@ def _fast_tmux_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_mod, "_VERIFY_PROBE_TIMEOUT_S", 0.05)
     monkeypatch.setattr(_mod, "_VERIFY_RETRY_INTERVAL_S", 0.0)
     monkeypatch.setattr(_mod, "_VERIFY_RETRY_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(_mod, "_DELIVERY_RETRY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(_mod, "_DELIVERY_RETRY_BACKOFF_S", (0.0,))
+    monkeypatch.setattr(_mod, "_NOTICE_DISMISS_SETTLE_S", 0.0)
 
 
 def test_inject_user_message_via_tui_happy_path(
@@ -2162,3 +2165,411 @@ def test_ensure_agy_feedback_survey_disabled_write_failure_never_raises(
     leftover = [p.name for p in settings.parent.iterdir() if p.name != settings.name]
     assert leftover == []
     assert "could not write" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Startup notice cards, wrapped/scrolled drafts, and bounded render retry
+# ---------------------------------------------------------------------------
+
+_RULE = "─" * 80
+_VERBOSITY_CARD = (
+    " ┃ Verbosity now defaults to medium\n"
+    " ┃ Verbosity is now medium by default, so tool calls and thoughts roll up into\n"
+    " ┃ summaries. You can change your preferred verbosity anytime in /config >\n"
+    " ┃ Verbosity.\n"
+    " ┃ esc to dismiss"
+)
+
+
+class _FakeAgyTui:
+    """
+    A stateful stand-in for agy 1.4.6's TUI, driven through ``subprocess.run``.
+
+    Renders the framed composer between two rules, an optional notice card on
+    top of it, and a draft soft-wrapped at 78 columns. Esc on an empty composer
+    dismisses the card (agy ignores Esc while a draft is present); ``C-k`` and
+    ``BSpace`` delete one row each; Enter starts a turn when a draft is shown.
+
+    :param notice: Initial card text above the composer (``""`` for none).
+    :param render_after_pastes: The paste number whose draft first renders;
+        earlier pastes never reach the composer (``0`` = never renders).
+    :param dismissable: Whether Esc removes the card.
+    :param active: Whether a turn is already running (``esc to cancel`` footer).
+    """
+
+    def __init__(
+        self,
+        *,
+        notice: str = "",
+        render_after_pastes: int = 1,
+        dismissable: bool = True,
+        active: bool = False,
+    ) -> None:
+        self.notice = notice
+        self.render_after_pastes = render_after_pastes
+        self.dismissable = dismissable
+        self.active = active
+        self.draft_rows: list[str] = []
+        self.loaded: list[str] = []
+        self.pastes = 0
+        self.escapes = 0
+        self.submitted: list[str] = []
+        self.calls: list[list[str]] = []
+
+    def pane(self) -> str:
+        """Render the pane the way agy lays it out."""
+        parts = ["      Antigravity CLI 1.4.6", ""]
+        if self.notice:
+            parts.append(self.notice)
+        parts.append(_RULE)
+        if self.draft_rows:
+            parts.append(f"> {self.draft_rows[0]}")
+            parts.extend(f"  {row}" for row in self.draft_rows[1:])
+        else:
+            parts.append(">")
+        parts.append(_RULE)
+        if self.active:
+            parts.append("esc to cancel")
+        elif not self.draft_rows:
+            parts.append("? for shortcuts")
+        return "\n".join(parts)
+
+    @staticmethod
+    def wrap(text: str) -> list[str]:
+        """Soft-wrap like agy: break on spaces, hard-break words wider than a row."""
+        rows: list[str] = []
+        for source in text.split("\n"):
+            row = ""
+            for word in source.split(" "):
+                while len(word) > 78:
+                    if row:
+                        rows.append(row)
+                        row = ""
+                    rows.append(word[:78])
+                    word = word[78:]
+                candidate = f"{row} {word}" if row else word
+                if len(candidate) > 78:
+                    rows.append(row)
+                    row = word
+                else:
+                    row = candidate
+            rows.append(row)
+        return [r for r in rows if r]
+
+    def run(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Handle one tmux invocation."""
+        del kwargs
+        self.calls.append(cmd)
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=self.pane(), stderr="")
+        if "load-buffer" in cmd:
+            raw = Path(cmd[-1]).read_bytes().decode("utf-8")
+            self.loaded.append(raw.replace("\r", "\n").rstrip("\n"))
+        if "paste-buffer" in cmd:
+            self.pastes += 1
+            if self.render_after_pastes and self.pastes >= self.render_after_pastes:
+                self.draft_rows = self.draft_rows + self.wrap(self.loaded[-1])
+        if "send-keys" in cmd:
+            for key in cmd[cmd.index("main") + 1 :]:
+                self._key(key)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def _key(self, key: str) -> None:
+        if key == "Escape":
+            self.escapes += 1
+            if self.notice and self.dismissable and not self.draft_rows and not self.active:
+                self.notice = ""
+        elif key in ("C-k", "BSpace") and self.draft_rows:
+            self.draft_rows = self.draft_rows[:-1]
+        elif key == "Enter" and self.draft_rows:
+            self.submitted.append(" ".join(self.draft_rows))
+            self.draft_rows = []
+            self.notice = ""  # sending a message hides the card for the session
+            self.active = True
+
+
+def _install_fake_tui(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tui: _FakeAgyTui) -> Path:
+    """Advertise a tmux target and route ``subprocess.run`` to *tui*."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    monkeypatch.setattr("subprocess.run", tui.run)
+    return bridge_dir
+
+
+def test_agy_startup_notice_detects_known_and_generic_cards() -> None:
+    """A card above the composer is found by its dismiss hint or known text."""
+    verbosity = f"header\n\n{_VERBOSITY_CARD}\n{_RULE}\n>\n{_RULE}\n? for shortcuts"
+    notice = _mod._agy_startup_notice(verbosity)
+    assert notice.splitlines()[0] == "Verbosity now defaults to medium"
+    assert "esc to dismiss" in notice
+
+    generic = f" ┃ New model available: try it\n ┃ Esc to dismiss\n{_RULE}\n>\n{_RULE}\n"
+    assert "New model available" in _mod._agy_startup_notice(generic)
+
+    no_hint = f" ┃ Verbosity now defaults to medium\n{_RULE}\n>\n{_RULE}\n"
+    assert _mod._agy_startup_notice(no_hint) == "Verbosity now defaults to medium"
+
+
+def test_agy_startup_notice_ignores_draft_and_unframed_panes() -> None:
+    """The user's own draft or a pane without the composer frame is not a notice."""
+    draft = f"  PONG\n\n{_RULE}\n> please press esc to dismiss the dialog\n{_RULE}\n"
+    assert _mod._agy_startup_notice(draft) == ""
+    assert _mod._agy_startup_notice("> \n? for shortcuts") == ""
+    transcript = f"  plain transcript line\n{_RULE}\n>\n{_RULE}\n? for shortcuts"
+    assert _mod._agy_startup_notice(transcript) == ""
+
+
+def test_draft_in_input_region_matches_soft_wrapped_head_needle() -> None:
+    """
+    A first line agy wrapped across rows still counts as the rendered draft.
+
+    The exact pane shape from the agy 1.4.6 failures: a long path on the first
+    line splits the 24-char head needle over two composer rows, which the old
+    per-row match reported as "not rendered" while the text sat in the input.
+    """
+    content = (
+        "Work in /Users/someone/Documents/repos/project/.worktrees/dls-mining-r3\n"
+        "1. Read and follow metrics/dls/mined/round3_brief.md exactly. No commits, no PRs."
+    )
+    pane = (
+        f"{_VERBOSITY_CARD}\n{_RULE}\n"
+        "> Work in\n"
+        "  /Users/someone/Documents/repos/project/.worktrees/dls-mining-r3\n"
+        "  1. Read and follow metrics/dls/mined/round3_brief.md exactly. No commits, no\n"
+        f"  PRs.\n{_RULE}\n"
+    )
+    baseline = ">"
+    needle = _mod._submit_needle(content)
+    assert needle == "Work in /Users/someone/D"
+    assert _mod._draft_in_input_region(pane, needle, baseline)
+
+
+def test_draft_in_input_region_matches_scrolled_composer() -> None:
+    """A draft taller than the capped composer shows only its tail and still counts."""
+    content = "START first line\n" + "\n".join(f"line {i} " + "word " * 40 for i in range(6))
+    tail = _mod._submit_tail_needle(content)
+    pane = f"{_RULE}\n> ↑ 19 more lines\n  word word word word\n  {tail}\n{_RULE}\n"
+    assert _mod._draft_in_input_region(pane, _mod._submit_needle(content), ">", tail)
+    # Even without a usable tail needle the scroll marker itself is a draft.
+    marker_only = f"{_RULE}\n> ↑ 3 more lines\n  zzz\n{_RULE}\n"
+    assert _mod._draft_in_input_region(marker_only, "START first line", ">")
+    # An empty composer after the submit is not a draft.
+    assert not _mod._draft_in_input_region(f"{_RULE}\n>\n{_RULE}\n", "START", "", tail)
+
+
+def test_inject_dismisses_startup_notice_then_delivers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """Notice present -> one Esc on the empty prompt dismisses it -> one paste, one Enter."""
+    tui = _FakeAgyTui(notice=_VERBOSITY_CARD)
+    bridge_dir = _install_fake_tui(tmp_path, monkeypatch, tui)
+    content = "Reply with exactly the word PONG and nothing else."
+
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert tui.escapes == 1
+    escape_index = next(i for i, c in enumerate(tui.calls) if c[-1] == "Escape")
+    paste_index = next(i for i, c in enumerate(tui.calls) if "paste-buffer" in c)
+    assert escape_index < paste_index, "the card must be dismissed before the paste"
+    assert tui.pastes == 1
+    assert tui.submitted == [content]
+
+
+def test_inject_never_sends_escape_while_a_turn_is_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A mid-turn steer must not press Esc (agy would cancel the running turn)."""
+    tui = _FakeAgyTui(notice=_VERBOSITY_CARD, active=True)
+    bridge_dir = _install_fake_tui(tmp_path, monkeypatch, tui)
+
+    inject_user_message_via_tui(bridge_dir, content="steer this way please", timeout_s=0.5)
+
+    assert tui.escapes == 0
+    assert tui.pastes == 1
+
+
+def test_inject_retries_slow_render_without_double_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A first paste that never renders is re-pasted into a confirmed-empty
+    composer; the turn is submitted exactly once with exactly one copy of the text.
+    """
+    tui = _FakeAgyTui(notice=_VERBOSITY_CARD, render_after_pastes=2)
+    bridge_dir = _install_fake_tui(tmp_path, monkeypatch, tui)
+    monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_mod, "_DELIVERY_RETRY_TIMEOUT_S", 5.0)
+    content = "Reply with exactly the word PONG and nothing else."
+
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert tui.pastes == 2
+    assert tui.submitted == [content]
+    assert sum(1 for c in tui.calls if c[-1] == "Enter") == 1
+
+
+def test_inject_clears_late_rendered_draft_before_repaste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A first paste that lands after its render window is cleared, not doubled.
+
+    The draft shows up only once the first wait gave up; the retry must wipe it
+    row by row before re-pasting, so the submitted text appears exactly once.
+    """
+    tui = _FakeAgyTui()
+    bridge_dir = _install_fake_tui(tmp_path, monkeypatch, tui)
+    monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_mod, "_DELIVERY_RETRY_TIMEOUT_S", 5.0)
+    content = "first row of the task\nsecond row of the task\nthird row of the task"
+    real_wait = _mod._wait_for_draft_render
+    waits = {"n": 0}
+
+    def _late_first_render(*args: object, **kwargs: object) -> tuple[bool, str]:
+        waits["n"] += 1
+        if waits["n"] == 1:
+            return False, tui.pane()  # the draft renders only after this window
+        return real_wait(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_mod, "_wait_for_draft_render", _late_first_render)
+
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert tui.pastes == 2
+    assert tui.submitted == [" ".join(content.splitlines())]
+
+
+def test_inject_does_not_repaste_into_unrecognized_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """Without a visible composer frame the paste is sent once, never stacked."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    pastes = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout="Some modal\n? for shortcuts", stderr="")
+        if "paste-buffer" in cmd:
+            pastes["n"] += 1
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="did not render the pasted message"):
+        inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+    assert pastes["n"] == 1
+
+
+def test_inject_fails_loud_naming_a_persistent_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A card that survives Esc while the paste never renders fails with its text."""
+    tui = _FakeAgyTui(notice=_VERBOSITY_CARD, render_after_pastes=0, dismissable=False)
+    bridge_dir = _install_fake_tui(tmp_path, monkeypatch, tui)
+    monkeypatch.setattr(_mod, "_PASTE_COMMIT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_mod, "_DELIVERY_RETRY_TIMEOUT_S", 0.3)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+
+    message = str(excinfo.value)
+    assert "did not render the pasted message" in message
+    assert "startup notice still on screen" in message
+    assert "Verbosity now defaults to medium" in message
+    assert tui.pastes >= 2, "the paste must be retried before failing"
+    assert tui.escapes <= _mod._MAX_NOTICE_DISMISSALS * tui.pastes
+    assert tui.submitted == []
+
+
+def test_inject_delivers_long_wrapped_message_in_one_paste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A long multi-row draft whose first line wraps is recognized on the first paste."""
+    tui = _FakeAgyTui(notice=_VERBOSITY_CARD)
+    bridge_dir = _install_fake_tui(tmp_path, monkeypatch, tui)
+    content = (
+        "Work in /Users/someone/Documents/repos/project/.worktrees/dls-mining-r3\n"
+        + "\n".join(f"{i}. " + "follow the brief carefully and report back " * 4 for i in range(8))
+    )
+
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert tui.pastes == 1
+    assert len(tui.submitted) == 1
+
+
+def test_seed_isolated_agy_home_predismisses_known_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh isolated dir carries the known card id so agy does not re-show it."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    seed_isolated_agy_home(bridge_dir)
+
+    state = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "nux_state.json"
+    assert json.loads(state.read_text(encoding="utf-8")) == {"dismissed": [51]}
+
+
+def test_seed_isolated_agy_home_merges_real_and_session_dismissals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's real dismissals and the session's own survive a re-seed."""
+    fake_home = tmp_path / "real-home"
+    real_state = fake_home / ".gemini" / "antigravity-cli" / "cache" / "nux_state.json"
+    real_state.parent.mkdir(parents=True)
+    real_state.write_text(json.dumps({"dismissed": [7, 51], "other": 1}), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_state = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "nux_state.json"
+    iso_state.parent.mkdir(parents=True)
+    iso_state.write_text(json.dumps({"dismissed": [99]}), encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    seeded = json.loads(iso_state.read_text(encoding="utf-8"))
+    assert seeded == {"dismissed": [7, 51, 99], "other": 1}
+    # The real file is read, never modified.
+    assert json.loads(real_state.read_text(encoding="utf-8")) == {
+        "dismissed": [7, 51],
+        "other": 1,
+    }
+
+
+def test_seed_isolated_agy_home_ignores_malformed_real_nux_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt real ``nux_state.json`` still yields the known pre-dismissals."""
+    fake_home = tmp_path / "real-home"
+    real_state = fake_home / ".gemini" / "antigravity-cli" / "cache" / "nux_state.json"
+    real_state.parent.mkdir(parents=True)
+    real_state.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    seed_isolated_agy_home(bridge_dir)
+
+    state = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "cache" / "nux_state.json"
+    assert json.loads(state.read_text(encoding="utf-8")) == {"dismissed": [51]}
