@@ -348,6 +348,13 @@ _AGY_SEED_FILES = (
 )
 
 
+# agy's record of dismissed announcement cards, relative to the Gemini dir.
+_AGY_NUX_STATE = Path("antigravity-cli") / "cache" / "nux_state.json"
+# Card ids pre-dismissed in every isolated dir. 51 is agy 1.4.6's "Verbosity now
+# defaults to medium" card (captured by dismissing it in a throwaway dir).
+_AGY_PREDISMISSED_NUX_IDS = (51,)
+
+
 # agy resolves imported plugins (skills + hooks) relative to its Gemini dir, so a
 # bridge-owned ``--gemini_dir`` starts with none of the user's plugins unless they
 # are seeded. ``plugins/`` is symlinked rather than copied: the payload is a git
@@ -511,8 +518,10 @@ def seed_isolated_agy_home(
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
-    Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
-    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini``.
+    Copies known file-based agy OAuth markers, the user's ``settings.json``
+    (backend config such as the GCP project/location block), and
+    onboarding/migration state (NEVER moving or modifying the real files) into
+    ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
     auth that is not portable to a relocated ``HOME``. The relay's
@@ -546,28 +555,49 @@ def seed_isolated_agy_home(
             dst.write_bytes(src.read_bytes())
             os.chmod(dst, 0o600)
 
+    # Seed the user's real settings as the base of the isolated settings file —
+    # they carry backend config agy needs at turn time, notably the ``gcp``
+    # block (project + location) for GCP/enterprise logins, without which every
+    # turn fails server-side with ``invalid location: ""``. Copied only when the
+    # isolated file is absent so a re-seed never clobbers per-session edits (the
+    # trust / survey seeders then merge their keys on top).
+    real_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    iso_settings = iso_gemini / "antigravity-cli" / "settings.json"
+    if real_settings.is_file() and not iso_settings.exists():
+        with contextlib.suppress(OSError):
+            iso_settings.write_bytes(real_settings.read_bytes())
+            os.chmod(iso_settings, 0o600)
+
     # Seed the onboarding-complete marker so the first-run wizard never blocks a
-    # headless launch (same state ``ensure_agy_onboarding_complete`` writes).
+    # headless launch. The user's real marker is preferred: it carries auth-flow
+    # state the synthetic default lacks (``enterpriseOnboardingComplete``,
+    # ``previousAuthMethod``), without which an enterprise/GCP login re-enters
+    # the first-run wizard and blocks TUI injection.
     onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
+    real_onboarding = real_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
     with contextlib.suppress(OSError):
-        onboarding.write_text(
-            json.dumps(
-                {
-                    "consumerOnboardingComplete": True,
-                    "enterpriseOnboardingComplete": False,
-                    "onboardingComplete": True,
-                },
-                sort_keys=True,
+        if real_onboarding.is_file():
+            onboarding.write_bytes(real_onboarding.read_bytes())
+        else:
+            onboarding.write_text(
+                json.dumps(
+                    {
+                        "consumerOnboardingComplete": True,
+                        "enterpriseOnboardingComplete": False,
+                        "onboardingComplete": True,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
             )
-            + "\n",
-            encoding="utf-8",
-        )
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
     # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
     with contextlib.suppress(OSError):
         (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
 
+    _seed_isolated_agy_dismissed_notices(real_home, iso_gemini)
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
 
@@ -575,6 +605,46 @@ def seed_isolated_agy_home(
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
 
     return {}
+
+
+def _read_agy_nux_state(path: Path) -> dict[str, object]:
+    """Return a ``nux_state.json`` object, or ``{}`` when absent or malformed."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _seed_isolated_agy_dismissed_notices(real_home: Path, iso_gemini: Path) -> None:
+    """Pre-dismiss agy's one-time announcement cards in the isolated Gemini dir.
+
+    agy records a dismissed card (Esc on an empty prompt) as its numeric id in
+    ``cache/nux_state.json``; a fresh isolated dir therefore re-shows every card
+    on each session. Merges the user's real dismissals, the session's own, and
+    :data:`_AGY_PREDISMISSED_NUX_IDS`. Defense-in-depth only: the TUI delivery
+    path still detects and dismisses any card it finds.
+
+    Best-effort: a malformed source is ignored and a write failure is swallowed.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    iso_state = iso_gemini / _AGY_NUX_STATE
+    real_state = _read_agy_nux_state(real_home / ".gemini" / _AGY_NUX_STATE)
+    data = {**real_state, **_read_agy_nux_state(iso_state)}
+    dismissed: set[int] = set(_AGY_PREDISMISSED_NUX_IDS)
+    for source in (real_state, data):
+        ids = source.get("dismissed")
+        if isinstance(ids, list):
+            dismissed.update(i for i in ids if isinstance(i, int) and not isinstance(i, bool))
+    data["dismissed"] = sorted(dismissed)
+    with contextlib.suppress(OSError):
+        iso_state.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = iso_state.with_suffix(iso_state.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, iso_state)
 
 
 def _seed_isolated_agy_plugins(real_home: Path, iso_gemini: Path) -> None:
@@ -936,8 +1006,23 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 _TMUX_READY_TIMEOUT_S = 30.0
 # Poll cadence for the readiness / paste-commit / submit-verify loops.
 _TMUX_POLL_INTERVAL_S = 0.2
-# How long to wait for the pasted draft to render in the input box before Enter.
+# How long one paste attempt waits for the draft to render in the input box.
 _PASTE_COMMIT_TIMEOUT_S = 5.0
+# Total budget for re-pasting a draft that never rendered (startup notice, slow
+# first render). Each re-paste only follows a confirmed-empty composer.
+_DELIVERY_RETRY_TIMEOUT_S = 20.0
+# Pause before each re-paste attempt; the last value repeats.
+_DELIVERY_RETRY_BACKOFF_S = (0.5, 1.0, 2.0)
+# Upper bound on ``C-a C-k BSpace`` rounds per clear pass. agy's composer has no
+# clear-all key: ``C-k`` only kills to end of line, so a multi-line draft is
+# removed one row at a time.
+_MAX_CLEAR_KEY_ROUNDS = 60
+# Clear passes (send rounds, re-capture) before the composer is declared stuck.
+_MAX_CLEAR_PASSES = 3
+# Esc presses spent dismissing stacked startup notices before delivery proceeds.
+_MAX_NOTICE_DISMISSALS = 3
+# Pause after a dismissing Esc so agy redraws before the pane is re-read.
+_NOTICE_DISMISS_SETTLE_S = 0.4
 # Settle pause after the draft renders, before the submit Enter.
 _PASTE_SETTLE_S = 0.2
 # How long one submit Enter is given to start a turn before it is re-sent.
@@ -954,13 +1039,24 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 _AGY_ACTIVE_MARKER = "esc to cancel"
 # agy collapses a paste carrying many line breaks into a single placeholder row
 # (``[Pasted text #1 +17 lines]``) instead of echoing the text into the composer.
-# The threshold is line-count based — ~13+ line breaks; total length does not
-# matter, so a long single-line message still renders verbatim (measured against
-# agy 1.1.8). The pasted text is therefore NEVER visible for a multi-line prompt,
-# which is exactly the shape a sub-agent task prompt has. Treated as draft content
+# The threshold is ~13+ line breaks (agy 1.1.8); agy 1.4.6 also collapses a very
+# long single line (``[Pasted text #1 3203 chars]``). Treated as draft content
 # so both the render gate and the submit verification key off the placeholder
 # appearing and then leaving the composer.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
+# agy caps the composer height: a draft that wraps past it scrolls, showing only
+# its tail under a ``↑ 39 more lines`` row (measured against agy 1.4.6).
+_AGY_COMPOSER_SCROLL_RE = re.compile(r"^[↑↓]\s*(\d+)\s+more\s+lines?\b")
+# agy 1.4.x renders one-time announcement cards (``┃`` gutter) directly above
+# the composer, footed by a dismiss hint. Esc on an EMPTY prompt dismisses the
+# card permanently; Esc with a draft is a no-op. Detection keys off the hint so
+# future cards are covered; the known texts are a fallback.
+_AGY_NOTICE_DISMISS_RE = re.compile(r"\besc(?:ape)?\b.{0,12}\bdismiss", re.IGNORECASE)
+_AGY_KNOWN_NOTICES = ("verbosity now defaults to medium",)
+# Gutter glyphs stripped from notice rows for diagnostics.
+_AGY_NOTICE_GUTTERS = "┃│▌▎ "
+# Rows read above the composer when looking for a notice card.
+_AGY_NOTICE_MAX_LINES = 12
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1209,6 +1305,30 @@ def _submit_needle(content: str) -> str:
     return stripped[:24] if len(stripped) >= 4 else ""
 
 
+def _submit_tail_needle(content: str) -> str:
+    """
+    A stable substring from the END of the message, for a scrolled composer.
+
+    agy keeps the cursor at the end of a draft, so when the draft overflows the
+    capped composer height only its tail is visible and the head needle from
+    :func:`_submit_needle` is scrolled out.
+
+    :param content: Message content.
+    :returns: Up to the last 24 chars of the last line with at least 4 non-space
+        chars, or ``""`` when no such line exists.
+    """
+    for line in reversed(content.splitlines()):
+        stripped = line.strip()
+        if len(stripped) >= 4:
+            return stripped[-24:]
+    return ""
+
+
+def _squash_whitespace(text: str) -> str:
+    """Drop all whitespace so text matches across agy's soft-wrapped rows."""
+    return "".join(text.split())
+
+
 def _redact_pane_secrets(text: str) -> str:
     """Redact emails and common secret shapes from a pane tail.
 
@@ -1269,7 +1389,12 @@ def _agy_separator_line(line: str) -> bool:
     return all(char in _AGY_BOX_GLYPHS for char in stripped if not char.isspace())
 
 
-def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool:
+def _draft_in_input_region(
+    pane: str,
+    needle: str,
+    baseline_region: str,
+    tail_needle: str = "",
+) -> bool:
     """
     Return whether the pasted draft is still visible in agy's composer.
 
@@ -1277,7 +1402,12 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     already present before this paste. Candidate lines are normalized by removing
     agy's leading ``>`` prompt glyph.
 
-    When *needle* is empty (a message too short for a stable needle, e.g.
+    Needles are matched whitespace-insensitively against the joined composer
+    rows: agy soft-wraps a draft at the pane width (a long path on the first line
+    splits the head needle across rows), and a draft taller than the capped
+    composer scrolls so only its tail (*tail_needle*) is visible.
+
+    When both needles are empty (a message too short for a stable needle, e.g.
     ``"ok"``), any draft-like content in a composer that differs from the
     pre-paste baseline counts as present — so short messages are still render- and
     submit-verified by composer state instead of being submitted blind.
@@ -1290,15 +1420,13 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     # match; the placeholder itself IS the draft (see _AGY_PASTE_PLACEHOLDER_RE).
     if any(_AGY_PASTE_PLACEHOLDER_RE.search(line) for line in candidates):
         return True
-    normalized_needle = needle.strip() if needle else ""
-    if not normalized_needle:
+    if any(_AGY_COMPOSER_SCROLL_RE.match(line) for line in candidates):
+        return True
+    needles = [_squash_whitespace(n) for n in (needle, tail_needle) if n and n.strip()]
+    if not needles:
         return bool(candidates)
-    return any(
-        line == normalized_needle
-        or line.startswith(normalized_needle)
-        or normalized_needle in line
-        for line in candidates
-    )
+    joined = _squash_whitespace("".join(candidates))
+    return any(n in joined for n in needles)
 
 
 def _agy_draft_candidate_lines(region: str) -> list[str]:
@@ -1327,6 +1455,206 @@ def _agy_draft_candidate_lines(region: str) -> list[str]:
             continue
         candidates.append(line)
     return candidates
+
+
+def _agy_composer_separators(pane: str) -> list[int]:
+    """Return the row indexes of agy's composer separator rules in *pane*."""
+    return [index for index, line in enumerate(pane.splitlines()) if _agy_separator_line(line)]
+
+
+def _agy_composer_visible(pane: str) -> bool:
+    """Return whether agy's framed bottom composer is on screen."""
+    return len(_agy_composer_separators(pane)) >= 2
+
+
+def _agy_composer_empty(pane: str) -> bool:
+    """Return whether the visible composer holds no draft text."""
+    return not _agy_draft_candidate_lines(_agy_input_region(pane))
+
+
+def _agy_startup_notice(pane: str) -> str:
+    """
+    Return the text of a dismissable notice card above the composer, else ``""``.
+
+    agy stacks one-time announcement cards (e.g. "Verbosity now defaults to
+    medium") directly on top of the composer. The block of rows immediately above
+    the composer's top rule counts as a notice when it carries a dismiss hint
+    (``esc to dismiss``) or a known notice text. Scoping to that block keeps
+    transcript history and the user's own draft from matching.
+
+    :param pane: Captured pane text.
+    :returns: The notice rows with gutter glyphs stripped, or ``""``.
+    """
+    lines = pane.splitlines()
+    separators = _agy_composer_separators(pane)
+    if len(separators) < 2:
+        return ""
+    index = separators[-2] - 1
+    while index >= 0 and not lines[index].strip():
+        index -= 1
+    block: list[str] = []
+    while index >= 0 and lines[index].strip() and len(block) < _AGY_NOTICE_MAX_LINES:
+        if _agy_separator_line(lines[index]):
+            break
+        block.append(lines[index].strip().lstrip(_AGY_NOTICE_GUTTERS))
+        index -= 1
+    text = "\n".join(reversed(block))
+    lowered = text.lower()
+    if _AGY_NOTICE_DISMISS_RE.search(text) or any(k in lowered for k in _AGY_KNOWN_NOTICES):
+        return text
+    return ""
+
+
+def _clear_agy_composer(socket_path: str, tmux_target: str, pane: str) -> str:
+    """
+    Remove every row of a leftover draft from agy's composer.
+
+    ``C-a C-k`` only empties the current row, so a multi-line draft is removed
+    with ``C-a C-k BSpace`` rounds (one row each), sized from the visible rows
+    plus any ``↑ N more lines`` scroll count, re-checked between passes.
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :param pane: The current pane capture.
+    :returns: The pane captured after the last clear pass.
+    """
+    for _ in range(_MAX_CLEAR_PASSES):
+        if _agy_composer_empty(pane):
+            return pane
+        candidates = _agy_draft_candidate_lines(_agy_input_region(pane))
+        rounds = len(candidates) + 1
+        for line in candidates:
+            scrolled = _AGY_COMPOSER_SCROLL_RE.match(line)
+            if scrolled:
+                rounds += int(scrolled.group(1))
+        keys = ["C-a", "C-k", "BSpace"] * min(rounds, _MAX_CLEAR_KEY_ROUNDS)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+        pane = _capture_pane(socket_path, tmux_target) or pane
+    return pane
+
+
+def _dismiss_agy_startup_notices(socket_path: str, tmux_target: str, pane: str) -> tuple[str, str]:
+    """
+    Dismiss notice cards stacked above an empty, idle composer with Esc.
+
+    Esc is only sent when the composer is empty (agy ignores it otherwise) and no
+    turn is running (Esc would cancel it). Bounded by
+    :data:`_MAX_NOTICE_DISMISSALS`; a card that survives is left to the render
+    check, which fails loud naming it.
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :param pane: The current pane capture.
+    :returns: ``(pane, notice)`` — the latest capture and the text of a notice
+        still showing (``""`` when none remains).
+    """
+    for _ in range(_MAX_NOTICE_DISMISSALS):
+        notice = _agy_startup_notice(pane)
+        if not notice or _AGY_ACTIVE_MARKER in pane or not _agy_composer_empty(pane):
+            return pane, notice
+        _logger.info(
+            "dismissing agy startup notice before delivery: %r", notice.splitlines()[0][:80]
+        )
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+        time.sleep(_NOTICE_DISMISS_SETTLE_S)
+        pane = _capture_pane(socket_path, tmux_target) or pane
+    return pane, _agy_startup_notice(pane)
+
+
+def _prepare_agy_composer(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    first_attempt: bool,
+) -> tuple[bool, str]:
+    """
+    Get agy's composer focused, free of notice cards, and empty before a paste.
+
+    The first attempt always sends ``C-a C-k`` (the long-standing line clear) so
+    a pane whose composer frame is not recognized still gets one paste. Clearing
+    the remaining rows and dismissing notices run only on a visible composer;
+    later attempts send nothing unless the composer is visible, so a draft that
+    landed in an unrecognized layout is never wiped and re-pasted on top.
+
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :param first_attempt: Whether this precedes the first paste.
+    :returns: ``(ready, notice)`` — whether the composer is confirmed visible and
+        empty, and the text of a notice card still showing (``""`` when none).
+    """
+    if first_attempt:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+    pane = _capture_pane(socket_path, tmux_target)
+    if not _agy_composer_visible(pane):
+        return False, _agy_startup_notice(pane)
+    pane = _clear_agy_composer(socket_path, tmux_target, pane)
+    if not _agy_composer_empty(pane):
+        return False, _agy_startup_notice(pane)
+    pane, notice = _dismiss_agy_startup_notices(socket_path, tmux_target, pane)
+    return _agy_composer_visible(pane) and _agy_composer_empty(pane), notice
+
+
+def _paste_into_agy(bridge_dir: Path, socket_path: str, tmux_target: str, content: str) -> None:
+    """
+    Stream *content* into the agy pane as one bracketed paste via a tmux buffer.
+
+    :param bridge_dir: Native Antigravity bridge directory (holds the temp file).
+    :param socket_path: tmux server socket path.
+    :param tmux_target: tmux pane target.
+    :param content: User text to paste.
+    :raises RuntimeError: When a tmux command fails.
+    """
+    # ``delete=False`` + name captured BEFORE the write, so a write failure still
+    # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
+    paste_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_path = paste_file.name
+            # Trailing newline absorbs any trailing backslash so it can't escape Enter.
+            paste_file.write(_paste_payload_bytes(content + "\n"))
+        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
+        _run_tmux(
+            socket_path,
+            "paste-buffer",
+            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+            "-d",  # drop the buffer after pasting (no stale copies server-side)
+            "-b",
+            _PASTE_BUFFER,
+            "-t",
+            tmux_target,
+        )
+    finally:
+        if paste_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+
+
+def _wait_for_draft_render(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+    tail_needle: str,
+    baseline_region: str,
+) -> tuple[bool, str]:
+    """
+    Poll until the pasted draft is visible in the composer.
+
+    :returns: ``(seen, last_pane)`` after at most :data:`_PASTE_COMMIT_TIMEOUT_S`.
+    """
+    last_pane = ""
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        last_pane = pane or last_pane
+        if _draft_in_input_region(pane, needle, baseline_region, tail_needle):
+            return True, last_pane
+        time.sleep(_TMUX_POLL_INTERVAL_S)
+    return False, last_pane
 
 
 def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
@@ -1362,6 +1690,7 @@ def _submit_and_verify(
     needle: str = "",
     baseline_region: str = "",
     draft_seen: bool = False,
+    tail_needle: str = "",
 ) -> None:
     """
     Press Enter to submit the pasted draft, verifying by composer state.
@@ -1423,10 +1752,10 @@ def _submit_and_verify(
                 )
             pane = _capture_pane(socket_path, tmux_target)
             last_pane = pane or last_pane
-            if pane and not _draft_in_input_region(pane, needle, baseline_region):
+            if pane and not _draft_in_input_region(pane, needle, baseline_region, tail_needle):
                 return
             time.sleep(_TMUX_POLL_INTERVAL_S)
-    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region)
+    draft_visible = _draft_in_input_region(last_pane, needle, baseline_region, tail_needle)
     raise RuntimeError(
         "agy did not accept the submitted message; the draft is still visible "
         "in the input box; "
@@ -1471,11 +1800,19 @@ def _paste_and_submit(
     content: str,
 ) -> None:
     """
-    Clear the composer, paste *content* through a tmux buffer, and submit it.
+    Prepare the composer, paste *content* through a tmux buffer, and submit it.
 
-    One delivery attempt, factored out of :func:`inject_user_message_via_tui` so
-    a turn agy rejected while verifying the account can be re-delivered verbatim.
+    One delivery, factored out of :func:`inject_user_message_via_tui` so a turn
+    agy rejected while verifying the account can be re-delivered verbatim.
     Assumes the readiness gates already passed.
+
+    **Render gate with bounded retry.** Before each paste the composer is cleared
+    and any startup notice card dismissed (:func:`_prepare_agy_composer`). A
+    paste whose draft never renders is re-pasted with backoff for up to
+    :data:`_DELIVERY_RETRY_TIMEOUT_S`, re-checking for notices each time. A
+    re-paste only follows a composer confirmed visible and empty, and Enter is
+    only pressed after the draft is seen, so a late-rendering first paste can
+    never be doubled or submitted twice.
 
     :param bridge_dir: Native Antigravity bridge directory (holds the temp paste
         file).
@@ -1484,65 +1821,75 @@ def _paste_and_submit(
     :param content: User text to deliver. Must be non-empty.
     :returns: None.
     :raises RuntimeError: When the TUI has exited, a tmux command fails, the
-        pasted draft never renders, or the submit never starts a turn.
+        pasted draft never renders within the retry budget (naming any notice
+        still on screen), or the submit never starts a turn.
     """
-    # Clear any leftover draft before typing: Home (C-a) + kill-to-end (C-k).
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
-    # ``delete=False`` + name captured BEFORE the write, so a write failure still
-    # leaves a path the finally can unlink (no leaked temp file in the bridge dir).
-    paste_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-        ) as paste_file:
-            paste_path = paste_file.name
-            # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-            paste_file.write(_paste_payload_bytes(content + "\n"))
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting (no stale copies server-side)
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        if paste_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(paste_path)
-    # Wait until the paste is visibly committed to the input box before Enter, so
-    # the submit is not folded into the paste burst (see _submit_and_verify). This
-    # runs for EVERY message — including short ones with no stable needle — so a
-    # paste that never lands in the composer is caught rather than submitted blind
-    # (``_draft_in_input_region`` keys off composer change when the needle is "").
     needle = _submit_needle(content)
+    tail_needle = _submit_tail_needle(content)
     # A mid-turn steer (agy already running a turn) is delivered best-effort: agy
     # queues it as the next turn and may not surface the draft in the composer the
-    # same way an idle turn does, so a non-render is NOT a swallowed message here.
-    # The render hard-fail below is for the idle/sequential case, where a paste
-    # that never lands in the composer (e.g. eaten by an unhooked modal such as
-    # the first-run trust gate) must fail loudly instead of vanishing.
+    # same way an idle turn does, so a non-render is NOT a swallowed message here,
+    # and it is never re-pasted or preceded by Esc (which would cancel the turn).
     mid_turn = _AGY_ACTIVE_MARKER in _capture_pane(socket_path, tmux_target)
-    draft_seen = False
-    last_commit_pane = ""
-    commit_deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < commit_deadline:
-        pane = _capture_pane(socket_path, tmux_target)
-        last_commit_pane = pane or last_commit_pane
-        if _draft_in_input_region(pane, needle, baseline_region):
-            draft_seen = True
-            break
-        time.sleep(_TMUX_POLL_INTERVAL_S)
-    if not draft_seen and not mid_turn:
-        raise RuntimeError(
-            "agy did not render the pasted message in its input box before submit; "
-            f"pane_tail:\n{_format_pane_debug_tail(last_commit_pane)}"
+    retry_deadline = time.monotonic() + _DELIVERY_RETRY_TIMEOUT_S
+    pastes = 0
+    attempt = 0
+    notice = ""
+    baseline_region = ""
+    while True:
+        if mid_turn:
+            ready = False
+            if attempt == 0:
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+        else:
+            ready, notice = _prepare_agy_composer(
+                socket_path, tmux_target, first_attempt=attempt == 0
+            )
+        if attempt == 0 or ready:
+            baseline_region = _agy_input_region(_capture_pane(socket_path, tmux_target))
+            _paste_into_agy(bridge_dir, socket_path, tmux_target, content)
+            pastes += 1
+        # Wait until the paste is visibly committed to the input box before Enter,
+        # so the submit is not folded into the paste burst (see
+        # _submit_and_verify). Runs for EVERY message, including short ones with no
+        # stable needle, so a paste that never lands is caught, not submitted blind.
+        draft_seen, last_pane = _wait_for_draft_render(
+            socket_path,
+            tmux_target,
+            needle=needle,
+            tail_needle=tail_needle,
+            baseline_region=baseline_region,
         )
+        mid_turn = mid_turn or _AGY_ACTIVE_MARKER in last_pane
+        if draft_seen or mid_turn:
+            break
+        if not _session_alive(socket_path, tmux_target):
+            raise RuntimeError(
+                "the agy terminal exited before the message could be submitted; "
+                "restart the session"
+            )
+        notice = _agy_startup_notice(last_pane) or notice
+        if time.monotonic() >= retry_deadline:
+            blocking = (
+                f"startup notice still on screen: {_redact_pane_secrets(notice)!r}"
+                if notice
+                else "no startup notice detected"
+            )
+            raise RuntimeError(
+                "agy did not render the pasted message in its input box before submit "
+                f"({pastes} paste attempt(s) over {_DELIVERY_RETRY_TIMEOUT_S:.0f}s; "
+                f"{blocking}); pane_tail:\n{_format_pane_debug_tail(last_pane)}"
+            )
+        backoff = _DELIVERY_RETRY_BACKOFF_S[min(attempt, len(_DELIVERY_RETRY_BACKOFF_S) - 1)]
+        _logger.warning(
+            "agy did not render the pasted message (attempt %d, notice=%r); retrying in %.1fs",
+            attempt + 1,
+            notice.splitlines()[0][:80] if notice else "",
+            backoff,
+        )
+        time.sleep(backoff)
+        attempt += 1
     time.sleep(_PASTE_SETTLE_S)
     _submit_and_verify(
         socket_path,
@@ -1550,6 +1897,7 @@ def _paste_and_submit(
         needle=needle,
         baseline_region=baseline_region,
         draft_seen=draft_seen,
+        tail_needle=tail_needle,
     )
 
 
@@ -1571,9 +1919,9 @@ def inject_user_message_via_tui(
 
     Steps: wait for the advertised tmux target and the agy input box (idle OR a
     running turn — agy accepts a mid-turn paste), then deliver via
-    :func:`_paste_and_submit` (clear the draft, stream the content through a named
-    tmux buffer, wait for the draft to render, submit and verify it left the live
-    composer).
+    :func:`_paste_and_submit` (clear the draft, dismiss any startup notice card,
+    stream the content through a named tmux buffer, wait for the draft to render
+    with a bounded re-paste, submit and verify it left the live composer).
 
     **Account-verification re-delivery.** A verified submit does not prove a turn
     started: agy also consumes a turn submitted before its startup eligibility
