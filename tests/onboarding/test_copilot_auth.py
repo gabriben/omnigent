@@ -279,8 +279,16 @@ def test_copilot_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> 
     """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
     monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install.sys, "executable", "/opt/venv/bin/python")
     cmd = copilot_install_command()
-    assert cmd == ["uv", "pip", "install", "omnigent[copilot]"]
+    assert cmd == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/opt/venv/bin/python",
+        "omnigent[copilot]",
+    ]
     assert not any("index" in part or "://" in part for part in cmd)
 
 
@@ -291,6 +299,7 @@ def test_copilot_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPat
     cmd = copilot_install_command()
     assert cmd == [
         extra_install.sys.executable,
+        "-P",
         "-m",
         "pip",
         "install",
@@ -339,7 +348,9 @@ def test_install_copilot_sdk_runs_command_then_rechecks(
     monkeypatch.setattr(copilot_auth, "copilot_sdk_installed", lambda: state["installed"])
 
     assert install_copilot_sdk() is True
-    assert calls == [[extra_install.sys.executable, "-m", "pip", "install", "omnigent[copilot]"]]
+    assert calls == [
+        [extra_install.sys.executable, "-P", "-m", "pip", "install", "omnigent[copilot]"]
+    ]
 
 
 def test_install_copilot_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
